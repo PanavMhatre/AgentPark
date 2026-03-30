@@ -291,20 +291,19 @@ export async function getAllAgentDecisions(state, levelRules) {
   const curBtnStates = (state.buttons || []).map(b => ({ id: b.id, pressed: b.pressed }));
   if (_mem.prevBtnStates) {
     for (const cur of curBtnStates) {
-      const prev = _mem.prevBtnStates.find(b => b.id === cur.id);
+      const prev = _mem.prevBtnStates.btns.find(b => b.id === cur.id);
       if (prev && !prev.pressed && cur.pressed) {
-        // Find which agent is on the button col (presser)
         const btn = (state.buttons || []).find(b => b.id === cur.id);
         const presser = btn ? state.agents.find(a => a.col === btn.col) : null;
         _mem.progressEvents.push({ tick: state.tick, event: 'btn_pressed', btnId: cur.id, agentId: presser?.id });
       }
     }
+    if (!_mem.prevBtnStates.keyCollected && state.key?.collected) {
+      const collector = state.agents.find(a => a.col === state.key?.col);
+      _mem.progressEvents.push({ tick: state.tick, event: 'key_collected', agentId: collector?.id });
+    }
   }
-  if (_mem.prevBtnStates?.keyCollected === false && state.key?.collected) {
-    const collector = state.agents.find(a => a.col === state.key?.col);
-    _mem.progressEvents.push({ tick: state.tick, event: 'key_collected', agentId: collector?.id });
-  }
-  _mem.prevBtnStates = { ...curBtnStates, keyCollected: !!state.key?.collected };
+  _mem.prevBtnStates = { btns: curBtnStates, keyCollected: !!state.key?.collected };
 
   // ── Track agent col history (last 4 positions) ────────────────────────────
   for (const a of state.agents) {
