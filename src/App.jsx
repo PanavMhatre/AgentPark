@@ -5,6 +5,7 @@ import { getAllAgentDecisions, getAllFallbackDecisions } from './agentAI.js';
 import { maxStepDurationMs } from './motionConfig.js';
 import GameScene from './components/GameScene.jsx';
 import AgentPanel from './components/AgentPanel.jsx';
+import LandingPage from './components/LandingPage.jsx';
 
 const MAX_TICKS = 280;
 
@@ -28,6 +29,7 @@ const PICO = {
 };
 
 export default function App() {
+  const [visitorType,     setVisitorType]      = useState(null); // null = landing, 'human', 'agent'
   const [levelIdx,        setLevelIdx]        = useState(0);
   const [gameState,       setGameState]        = useState(null);
   const [running,         setRunning]          = useState(false);
@@ -344,6 +346,10 @@ export default function App() {
 
 
   // ── UI ──────────────────────────────────────────────────────────────────────
+  if (!visitorType) {
+    return <LandingPage onSelect={setVisitorType} />;
+  }
+
   return (
     <div style={{ minHeight:'100vh', backgroundColor: PICO.bg, color: PICO.text, fontFamily:"'Nunito','Segoe UI',system-ui,sans-serif" }}>
 
@@ -458,42 +464,47 @@ export default function App() {
             }}
           >↺ Reset</button>
 
-          {/* Demo (deterministic, no LLM) */}
-          <button
-            onClick={() => startSim(true)}
-            disabled={showWin || (running && !demoRef.current)}
-            title="Run with built-in logic — no AI API needed"
-            style={{
-              padding:'7px 16px', borderRadius:10,
-              border:`3px solid ${running && demoRef.current ? PICO.red : PICO.blue}`,
-              backgroundColor: running && demoRef.current ? PICO.red : PICO.blue,
-              color:'#fff', fontWeight:900, fontSize:13,
-              cursor: (showWin || (running && !demoRef.current)) ? 'not-allowed' : 'pointer',
-              opacity: (showWin || (running && !demoRef.current)) ? 0.4 : 1,
-              boxShadow: running && demoRef.current ? `0 4px 0 #2563eb` : `0 4px 0 #1d4ed8`,
-              transition:'all 0.1s',
-            }}
-          >
-            {running && demoRef.current ? '⏸ Stop' : '⚡ Demo'}</button>
+          {/* Demo (deterministic, no LLM) — hidden for AI agents */}
+          {visitorType !== 'agent' && (
+            <button
+              onClick={() => startSim(true)}
+              disabled={showWin || (running && !demoRef.current)}
+              title="Run with built-in logic — no AI API needed"
+              style={{
+                padding:'7px 16px', borderRadius:10,
+                border:`3px solid ${running && demoRef.current ? PICO.red : PICO.blue}`,
+                backgroundColor: running && demoRef.current ? PICO.red : PICO.blue,
+                color:'#fff', fontWeight:900, fontSize:13,
+                cursor: (showWin || (running && !demoRef.current)) ? 'not-allowed' : 'pointer',
+                opacity: (showWin || (running && !demoRef.current)) ? 0.4 : 1,
+                boxShadow: running && demoRef.current ? `0 4px 0 #2563eb` : `0 4px 0 #1d4ed8`,
+                transition:'all 0.1s',
+              }}
+            >
+              {running && demoRef.current ? '⏸ Stop' : '⚡ Demo'}
+            </button>
+          )}
 
-          {/* Run/Pause (LLM) */}
-          <button
-            onClick={toggleSim}
-            disabled={showWin || (running && demoRef.current)}
-            title="Run with DeepSeek-R1 AI agents via Groq"
-            style={{
-              padding:'7px 22px', borderRadius:10,
-              border:`3px solid ${running && !demoRef.current ? PICO.red : PICO.orange}`,
-              backgroundColor: running && !demoRef.current ? PICO.red : PICO.orange,
-              color:'#fff', fontWeight:900, fontSize:14,
-              cursor: (showWin || (running && demoRef.current)) ? 'not-allowed' : 'pointer',
-              opacity: (showWin || (running && demoRef.current)) ? 0.4 : 1,
-              boxShadow: running && !demoRef.current ? `0 4px 0 #a93226` : `0 4px 0 #b85a35`,
-              transition:'all 0.1s',
-            }}
-          >
-            {running && !demoRef.current ? '⏸ Pause' : '▶ Run AI'}
-          </button>
+          {/* Run/Pause (LLM) — hidden for humans */}
+          {visitorType !== 'human' && (
+            <button
+              onClick={toggleSim}
+              disabled={showWin || (running && demoRef.current)}
+              title="Run with LLM agents via Groq"
+              style={{
+                padding:'7px 22px', borderRadius:10,
+                border:`3px solid ${running && !demoRef.current ? PICO.red : PICO.orange}`,
+                backgroundColor: running && !demoRef.current ? PICO.red : PICO.orange,
+                color:'#fff', fontWeight:900, fontSize:14,
+                cursor: (showWin || (running && demoRef.current)) ? 'not-allowed' : 'pointer',
+                opacity: (showWin || (running && demoRef.current)) ? 0.4 : 1,
+                boxShadow: running && !demoRef.current ? `0 4px 0 #a93226` : `0 4px 0 #b85a35`,
+                transition:'all 0.1s',
+              }}
+            >
+              {running && !demoRef.current ? '⏸ Pause' : '▶ Run AI'}
+            </button>
+          )}
         </div>
       </header>
 
