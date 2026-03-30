@@ -2,6 +2,8 @@
 
 > Pico Park, solved by AI agents in real time.
 
+**Live demo: [agent-pico-park.vercel.app](https://agent-pico-park.vercel.app)**
+
 4 cooperative LLM agents (A, B, C, D) work together to complete cooperative platformer puzzles — pressing buttons, collecting keys, crossing gates, and avoiding hazards. Each tick is a real Groq LLM call; the agents reason about each other's positions and coordinate their moves.
 
 ---
