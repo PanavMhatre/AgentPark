@@ -17,6 +17,25 @@ const GROQ_KEYS = [
 let _keyIndex = 0;
 function rotateKey() { const k = GROQ_KEYS[_keyIndex]; _keyIndex = (_keyIndex + 1) % GROQ_KEYS.length; return k; }
 
+// ── Session memory — persists across ticks within one run, reset on level restart ──
+let _mem = {
+  configCounts:   {},  // stateHash → times seen this run
+  progressEvents: [],  // [{ tick, event, btnId, agentId }] — what worked
+  prevBtnStates:  null, // last tick's button pressed states (to detect new presses)
+  agentColHistory: {}, // agentId → last 4 cols (detect lateral drift)
+};
+
+export function resetMemory() {
+  _mem = { configCounts: {}, progressEvents: [], prevBtnStates: null, agentColHistory: {} };
+}
+
+// Compact hash of (agent positions + button states) — same hash = stuck in same config
+function hashConfig(state) {
+  const pos  = state.agents.map(a => `${a.id}${a.col}`).join('');
+  const btns = (state.buttons || []).map(b => b.pressed ? '1' : '0').join('');
+  return `${pos}|${btns}`;
+}
+
 // ── Parse coordinator response (returns array of 4 agent actions) ──────────────
 function parseCoordinatorResponse(raw) {
   // Try to extract JSON even if response is truncated
@@ -144,17 +163,31 @@ function buildCoordinatorPrompt(state, levelRules) {
     `Exit:col${goalCol}`,
   ].filter(Boolean).join(' | ');
 
+  // ── Learning context from session memory ───────────────────────────────────
+  const learnedLines = _mem.progressEvents.slice(-4).map(e => {
+    if (e.event === 'btn_pressed') return `✓ ${e.btnId} pressed at t${e.tick} by ${e.agentId||'?'} → that agent should now ADVANCE RIGHT`;
+    if (e.event === 'key_collected') return `✓ key collected at t${e.tick} by ${e.agentId||'?'} → all agents should ADVANCE RIGHT`;
+    return null;
+  }).filter(Boolean);
+  const learnedSection = learnedLines.length
+    ? `\nLEARNED THIS RUN (use to guide decisions):\n${learnedLines.join('\n')}`
+    : '';
+
   return `COORDINATOR for agents A,B,C,D in Agent Park. Tick ${state.tick}.
 RULES: ${levelRules.replace(/\n/g,' ').slice(0,300)}
 MAP: ${mapLines}
 AGENTS (with SUGGESTED action computed from physics):
-${agentsDesc}
+${agentsDesc}${learnedSection}
 PHYSICS CONSTRAINTS:
 - jump from col X fails if col X+1 has any agent OR unpressed pad. Check before jumping.
 - Pads activate only via jump (from padCol-2) or move_up (on pad). Walking does NOT activate.
 - After pressing a pad: immediately move_left to vacate, freeing path for next pad.
 - Pads must be pressed ONE AT A TIME (left pad first when adjacent).
 - move_right stops automatically at closed gates/pads/walls.
+HARD RULES — NEVER violate:
+- Do NOT repeat an action that left an agent's col unchanged (⚠️STUCK means this happened).
+- Do NOT assign move_up unless an agent is on a button pad or stacking platform.
+- After a pad is pressed (see LEARNED), the pressing agent must advance right — do NOT send it back.
 INSTRUCTIONS: Follow the SUGGESTED action for each agent unless there is a ⚠️ or 🚧 warning. Fix warnings first. Respond ONLY with JSON:
 {"plan":"...","actions":[{"agentId":"A","thought":"≤5 words","action":"...","amount":1},{"agentId":"B","thought":"≤5 words","action":"...","amount":1},{"agentId":"C","thought":"≤5 words","action":"...","amount":1},{"agentId":"D","thought":"≤5 words","action":"...","amount":1}]}`;
 }
@@ -254,6 +287,41 @@ function lockedAction(agent, btn, state) {
 export async function getAllAgentDecisions(state, levelRules) {
   if (!GROQ_KEYS.length) throw new Error('No Groq API keys — add VITE_GROQ_KEY_1 to .env.local');
 
+  // ── Session memory: detect newly pressed buttons / collected key ──────────
+  const curBtnStates = (state.buttons || []).map(b => ({ id: b.id, pressed: b.pressed }));
+  if (_mem.prevBtnStates) {
+    for (const cur of curBtnStates) {
+      const prev = _mem.prevBtnStates.find(b => b.id === cur.id);
+      if (prev && !prev.pressed && cur.pressed) {
+        // Find which agent is on the button col (presser)
+        const btn = (state.buttons || []).find(b => b.id === cur.id);
+        const presser = btn ? state.agents.find(a => a.col === btn.col) : null;
+        _mem.progressEvents.push({ tick: state.tick, event: 'btn_pressed', btnId: cur.id, agentId: presser?.id });
+      }
+    }
+  }
+  if (_mem.prevBtnStates?.keyCollected === false && state.key?.collected) {
+    const collector = state.agents.find(a => a.col === state.key?.col);
+    _mem.progressEvents.push({ tick: state.tick, event: 'key_collected', agentId: collector?.id });
+  }
+  _mem.prevBtnStates = { ...curBtnStates, keyCollected: !!state.key?.collected };
+
+  // ── Track agent col history (last 4 positions) ────────────────────────────
+  for (const a of state.agents) {
+    if (!_mem.agentColHistory[a.id]) _mem.agentColHistory[a.id] = [];
+    _mem.agentColHistory[a.id].push(a.col);
+    if (_mem.agentColHistory[a.id].length > 4) _mem.agentColHistory[a.id].shift();
+  }
+
+  // ── Loop detection: same exact config seen 3+ times → force escape ────────
+  const configHash = hashConfig(state);
+  _mem.configCounts[configHash] = (_mem.configCounts[configHash] || 0) + 1;
+  const isLoop = _mem.configCounts[configHash] >= 3;
+  if (isLoop) {
+    // Reset count so escape gets a fresh chance next tick
+    _mem.configCounts[configHash] = 0;
+  }
+
   // Initialise or refresh sticky assignments (remove pressed buttons, assign freed agents)
   if (!state.btnAssignments) state.btnAssignments = {};
   // Clear assignments for buttons that are now pressed
@@ -298,6 +366,28 @@ export async function getAllAgentDecisions(state, levelRules) {
   const freeAgents = state.agents.filter(a => !lockedActions[a.id]);
   if (freeAgents.length === 0) {
     return state.agents.map(a => lockedActions[a.id]);
+  }
+
+  // ── Loop escape: spread free agents when same config repeats ─────────────
+  if (isLoop) {
+    // Sort free agents left-to-right; alternate push-right / pull-left to break clustering
+    const sorted = [...freeAgents].sort((a, b) => a.col - b.col);
+    const escapeActions = sorted.map((agent, i) => {
+      const colHist = _mem.agentColHistory[agent.id] || [];
+      const drifted = colHist.length >= 2 && colHist[colHist.length - 1] === colHist[colHist.length - 2];
+      // If this agent has been stationary: move opposite to last action
+      let action = 'move_right';
+      if (drifted) {
+        action = (agent.lastAction === 'move_right' || agent.lastAction === 'jump') ? 'move_left' : 'move_right';
+      } else {
+        // Alternate: even index go right, odd index go left (creates spread)
+        action = i % 2 === 0 ? 'move_right' : 'move_left';
+      }
+      return { agentId: agent.id, action, amount: 1, thought: 'break loop', message: '', reasoning: '' };
+    });
+    const escapeMap = Object.fromEntries(escapeActions.map(a => [a.agentId, a]));
+    return state.agents.map(a => lockedActions[a.id] || escapeMap[a.id]
+      || { agentId: a.id, action: 'move_right', amount: 1, thought: 'advance', message: '', reasoning: '' });
   }
 
   // Ask LLM only about free agents (or all if none are locked)

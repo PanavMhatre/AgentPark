@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { LEVELS } from './levels.js';
 import { applyActions } from './gameEngine.js';
-import { getAllAgentDecisions, getAllFallbackDecisions } from './agentAI.js';
+import { getAllAgentDecisions, getAllFallbackDecisions, resetMemory } from './agentAI.js';
 import { maxStepDurationMs } from './motionConfig.js';
 import GameScene from './components/GameScene.jsx';
 import AgentPanel from './components/AgentPanel.jsx';
@@ -72,6 +72,7 @@ export default function App() {
     fresh.levelFailed = false;
     fresh.failMessage = '';
     fresh.btnAssignments = {};
+    resetMemory();
     setGameState(fresh);
     stateRef.current = fresh;
     setShowWin(false);
@@ -231,6 +232,7 @@ export default function App() {
             fresh.levelFailed = false;
             fresh.failMessage = '';
             fresh.log = [{ type: 'system', tick: 0, text: '🔄 Retrying…' }];
+            resetMemory();
             blendRef.current = null;
             setMotionBlend(null);
             stateRef.current = fresh;
