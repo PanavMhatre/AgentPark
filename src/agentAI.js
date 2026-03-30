@@ -96,6 +96,17 @@ function buildCoordinatorPrompt(state, levelRules) {
     const stopAt = state.buttonGate && !state.buttonGate.open
       ? state.buttonGate.col - 1 : goalCol;
     if (agent.col >= stopAt) return `wait at col ${agent.col} (at gate/exit)`;
+    // If stuck on move_up with no reason, don't repeat it
+    if ((agent.stuckTicks || 0) > 0 && agent.lastAction === 'move_up') {
+      return `move_right 1 — move_up is stuck (nothing to climb), advance forward instead`;
+    }
+    // Button proximity: unassigned button exactly 2 cols ahead → jump now
+    const nearBtn = (state.buttons || []).find(b => !b.pressed && b.col === agent.col + 2);
+    if (nearBtn) {
+      const midCol = agent.col + 1;
+      const midBlocked = state.agents.some(x => x.id !== agent.id && x.col === midCol);
+      if (!midBlocked) return `jump → ${nearBtn.id} at col ${nearBtn.col} is 2 cols ahead — jump to activate it!`;
+    }
     return `move_right ${Math.min(stopAt - agent.col, 6)} → advance toward col ${stopAt}`;
   }
 
@@ -103,6 +114,7 @@ function buildCoordinatorPrompt(state, levelRules) {
   const agentsDesc = state.agents.map(a => {
     const role = assigned[a.id] ? `ASSIGNED→${assigned[a.id].id}` : 'ADVANCE';
     const sugg = suggest(a);
+    const lastInfo = a.lastAction ? ` last:${a.lastAction}` : '';
     let warn = '';
     if ((a.stuckTicks || 0) >= 1) {
       const midCol = a.col + 1;
@@ -110,12 +122,15 @@ function buildCoordinatorPrompt(state, levelRules) {
       const midBtn = (state.buttons||[]).find(b => b.latch && !b.pressed && b.col === midCol);
       if (a.lastAction === 'jump' && midAgent) warn = ` ⚠️BLOCKED:${a.stuckTicks}t jump blocked by ${midAgent.id}@col${midCol}→assign ${midAgent.id} move_left`;
       else if (a.lastAction === 'jump' && midBtn) warn = ` ⚠️BLOCKED:${a.stuckTicks}t jump blocked by pad@col${midCol}→press that pad first`;
-      else warn = ` ⚠️STUCK:${a.stuckTicks}t on ${a.lastAction}→try different action`;
+      else warn = ` ⚠️STUCK:${a.stuckTicks}t on ${a.lastAction}→do NOT repeat, try different action`;
     }
-    // Also flag if this agent is blocking someone's jump
+    // Flag if this agent is blocking someone's jump
     const blocking = state.agents.find(x => x.id !== a.id && (x.stuckTicks||0) >= 1 && x.lastAction === 'jump' && x.col + 1 === a.col);
     if (blocking) warn += ` 🚧BLOCKING ${blocking.id}'s jump→move_left NOW`;
-    return `${a.id}(col${a.col},row${a.row}) [${role}] SUGGESTED:${sugg}${warn}`;
+    // Flag if two agents are at the same column (crowding)
+    const sameCol = state.agents.find(x => x.id !== a.id && x.col === a.col && x.id < a.id);
+    if (sameCol) warn += ` 📍CROWDED col${a.col} with ${sameCol.id}→one must move_left to decongest`;
+    return `${a.id}(col${a.col},row${a.row}) [${role}]${lastInfo} SUGGESTED:${sugg}${warn}`;
   }).join('\n');
 
   // ── Map overview (compact) ──────────────────────────────────────────────────
@@ -203,7 +218,11 @@ function lockedAction(agent, btn, state) {
       return { action: 'jump', thought: `jump → ${btn.id}` };
     }
     if (midAgent) {
-      // Another agent is sitting in our mid-path — wait; they will be told to move
+      // Another agent is sitting in our mid-path — wait; they will be told to move.
+      // If we've been waiting too long, step back one col to give them room to act.
+      if ((agent.stuckTicks || 0) >= 3) {
+        return { action: 'move_left', thought: `clearing space — ${midAgent.id} stuck at col ${midCol}` };
+      }
       return { action: 'wait', thought: `waiting for ${midAgent.id} to clear col ${midCol}` };
     }
     if (midPad) {
@@ -260,6 +279,21 @@ export async function getAllAgentDecisions(state, levelRules) {
     }
   }
 
+  // Button-proximity heuristic: unassigned free agent exactly 2 cols before an unpressed button → jump deterministically
+  for (const agent of state.agents) {
+    if (lockedActions[agent.id]) continue;
+    const nearBtn = (state.buttons || []).find(b =>
+      !b.pressed && b.col === agent.col + 2 && !Object.values(state.btnAssignments).includes(b.id)
+    );
+    if (nearBtn) {
+      const midCol = agent.col + 1;
+      const midBlocked = state.agents.some(x => x.id !== agent.id && x.col === midCol);
+      if (!midBlocked) {
+        lockedActions[agent.id] = { agentId: agent.id, action: 'jump', amount: 1, thought: `→ ${nearBtn.id}`, message: '', reasoning: '' };
+      }
+    }
+  }
+
   // If ALL agents have locked actions, skip LLM entirely
   const freeAgents = state.agents.filter(a => !lockedActions[a.id]);
   if (freeAgents.length === 0) {
@@ -285,15 +319,39 @@ export async function getAllAgentDecisions(state, levelRules) {
       || { agentId: a.id, action: 'move_right', amount: 1, thought: 'advance', message: '', reasoning: '' };
   });
 
-  // Anti-loop: if a FREE agent is stuck 3+ ticks on same action, jiggle
+  // Anti-loop: if a FREE agent is stuck 2+ ticks on same action, jiggle
   final.forEach(act => {
     if (lockedActions[act.agentId]) return; // locked agents handled above
     const agent = state.agents.find(x => x.id === act.agentId);
-    if (!agent || (agent.stuckTicks || 0) < 3 || act.action !== agent.lastAction) return;
+    if (!agent || (agent.stuckTicks || 0) < 2 || act.action !== agent.lastAction) return;
     const isBlocker = state.agents.some(a => a.id !== agent.id && (a.stuckTicks||0) > 0 && a.lastAction === 'jump' && a.col + 1 === agent.col);
+    // If stuck on move_up (no platform above), move forward
+    if (agent.lastAction === 'move_up') {
+      act.action = 'move_right';
+      act.amount = 1;
+      act.thought = 'no platform — moving right';
+      return;
+    }
     act.action = (isBlocker || agent.col > 1) ? 'move_left' : 'move_right';
     act.amount = 1;
     act.thought = 'jiggle';
+  });
+
+  // Dedup: if two free agents are at the same column doing the same action, stagger one
+  const seenColAction = {};
+  final.forEach(act => {
+    if (lockedActions[act.agentId] || act.action === 'wait') return;
+    const agent = state.agents.find(x => x.id === act.agentId);
+    if (!agent) return;
+    const key = `${agent.col}:${act.action}`;
+    if (seenColAction[key]) {
+      // This agent is crowding — step it back one col
+      act.action = 'move_left';
+      act.amount = 1;
+      act.thought = 'decongest';
+    } else {
+      seenColAction[key] = true;
+    }
   });
 
   return final;
