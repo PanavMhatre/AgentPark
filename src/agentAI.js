@@ -19,14 +19,57 @@ function rotateKey() { const k = GROQ_KEYS[_keyIndex]; _keyIndex = (_keyIndex + 
 
 // ── Session memory — persists across ticks within one run, reset on level restart ──
 let _mem = {
-  configCounts:   {},  // stateHash → times seen this run
-  progressEvents: [],  // [{ tick, event, btnId, agentId }] — what worked
-  prevBtnStates:  null, // last tick's button pressed states (to detect new presses)
-  agentColHistory: {}, // agentId → last 4 cols (detect lateral drift)
+  configCounts:    {},
+  progressEvents:  [],
+  prevBtnStates:   null,
+  agentColHistory: {},
+  scoreHistory:    [],
+  deathHistory:    [], // survives soft-resets so AI learns across attempts
 };
 
+// Full reset — call when changing levels
 export function resetMemory() {
-  _mem = { configCounts: {}, progressEvents: [], prevBtnStates: null, agentColHistory: {} };
+  _mem = { configCounts: {}, progressEvents: [], prevBtnStates: null, agentColHistory: {}, scoreHistory: [], deathHistory: [] };
+}
+
+// Soft reset — call on death/auto-restart: clears run state but keeps death history
+export function softResetMemory() {
+  _mem = { configCounts: {}, progressEvents: [], prevBtnStates: null, agentColHistory: {}, scoreHistory: [], deathHistory: _mem.deathHistory };
+}
+
+// Record a death event — called from App.jsx before soft-resetting
+export function recordDeath(state) {
+  const groundY  = state.groundY ?? (state.gridRows - 1);
+  const pits     = state.pits || [];
+  const hazards  = (state.hazards || []).filter(h => h.row === groundY);
+  // Find agents that were at a fatal location
+  const victims = state.agents
+    .filter(a => pits.includes(a.col) || hazards.some(h => h.col === a.col))
+    .map(a => `${a.id}@(${a.col},${a.row})`);
+  const allPos = state.agents.map(a => `${a.id}:(${a.col},${a.row})`).join(' ');
+  _mem.deathHistory.push({
+    attempt: _mem.deathHistory.length + 1,
+    cause:   state.failMessage || 'fatal',
+    victims: victims.length ? victims.join(', ') : 'unknown',
+    allPos,
+    dangerCols: [...pits, ...hazards.map(h => h.col)],
+  });
+  if (_mem.deathHistory.length > 6) _mem.deathHistory.shift();
+}
+
+// Overall progress score: higher = closer to winning
+function computeProgressScore(state) {
+  const btnScore  = (state.buttons || []).filter(b => b.pressed).length * 100;
+  const keyScore  = state.key?.collected ? 50 : 0;
+  const maxCol    = Math.max(...state.agents.map(a => a.col));
+  return btnScore + keyScore + maxCol;
+}
+
+// Per-agent progress vector: net col change over last N recorded positions (+ = moving right)
+function agentProgressVector(agentId) {
+  const hist = _mem.agentColHistory[agentId] || [];
+  if (hist.length < 2) return 0;
+  return hist[hist.length - 1] - hist[0];
 }
 
 // Compact hash of (agent positions + button states) — same hash = stuck in same config
@@ -78,11 +121,13 @@ function parseCoordinatorResponse(raw) {
 
 // ── Coordinator prompt: full state + all 4 agents → 4 coordinated actions ──────
 function buildCoordinatorPrompt(state, levelRules) {
-  const goalCol = state.goalCol ?? 10;
-  const pits    = state.pits || [];
+  const goalCol  = state.goalCol ?? 10;
+  const groundY  = state.groundY ?? (state.gridRows - 1);
+  const pits     = state.pits || [];
+  const hazards  = state.hazards || [];
 
   // ── Assign each unpressed button to the closest agent ──────────────────────
-  const assigned = {};   // agentId → button
+  const assigned = {};
   const usedAgents = new Set();
   for (const btn of [...(state.buttons || [])].filter(b => !b.pressed).sort((a,b) => a.col - b.col)) {
     const jumpCol = btn.col - 2;
@@ -97,99 +142,133 @@ function buildCoordinatorPrompt(state, levelRules) {
     const btn = assigned[agent.id];
     if (btn) {
       const jumpCol = btn.col - 2;
-      if (agent.col === btn.col)        return `move_up (on pad, activate ${btn.id})`;
+      if (agent.col === btn.col) return `move_up — ON pad (${btn.col},${groundY}), activate ${btn.id}`;
       if (agent.col === jumpCol) {
-        // Check mid-path
         const midBlocked = state.agents.some(x => x.id !== agent.id && x.col === agent.col + 1)
-          || (state.buttons || []).some(b => b.latch && !b.pressed && b.id !== btn.id && b.col === agent.col + 1);
+          || (state.buttons||[]).some(b => b.latch && !b.pressed && b.id !== btn.id && b.col === agent.col + 1);
         if (midBlocked) {
           const blocker = state.agents.find(x => x.id !== agent.id && x.col === agent.col + 1);
-          return `wait — col ${agent.col+1} blocked by ${blocker ? blocker.id : 'pad'}. That agent must move_left first.`;
+          return `wait — (${agent.col+1},${groundY}) blocked by ${blocker ? blocker.id : 'pad'}, that agent must move_left`;
         }
-        return `jump → activate ${btn.id} at col ${btn.col}`;
+        return `jump — at (${agent.col},${groundY}), landing on pad (${btn.col},${groundY}) to activate ${btn.id}`;
       }
-      if (agent.col < jumpCol)  return `move_right ${jumpCol - agent.col} → reach jump spot col ${jumpCol}`;
-      if (agent.col > jumpCol)  return `move_left → back to jump spot col ${jumpCol}`;
+      if (agent.col < jumpCol) return `move_right ${jumpCol - agent.col} — from (${agent.col},${agent.row}) to jump spot (${jumpCol},${groundY}) for ${btn.id}`;
+      return `move_left — overshot, back from (${agent.col},${agent.row}) to jump spot (${jumpCol},${groundY})`;
     }
-    // Not assigned to a button — advance right, stops at gate/pit automatically
-    const stopAt = state.buttonGate && !state.buttonGate.open
-      ? state.buttonGate.col - 1 : goalCol;
-    if (agent.col >= stopAt) return `wait at col ${agent.col} (at gate/exit)`;
-    // If stuck on move_up with no reason, don't repeat it
-    if ((agent.stuckTicks || 0) > 0 && agent.lastAction === 'move_up') {
-      return `move_right 1 — move_up is stuck (nothing to climb), advance forward instead`;
-    }
-    // Button proximity: unassigned button exactly 2 cols ahead → jump now
-    const nearBtn = (state.buttons || []).find(b => !b.pressed && b.col === agent.col + 2);
+    // ADVANCE mode — push forward
+    const stopAt = state.buttonGate && !state.buttonGate.open ? state.buttonGate.col - 1 : goalCol;
+    if (agent.col >= stopAt) return `wait — at (${agent.col},${agent.row}), already at/past gate or exit col ${stopAt}`;
+    if ((agent.stuckTicks||0) > 0 && agent.lastAction === 'move_up')
+      return `move_right 1 — move_up stuck (no platform), advance from (${agent.col},${agent.row})`;
+    const nearBtn = (state.buttons||[]).find(b => !b.pressed && b.col === agent.col + 2);
     if (nearBtn) {
-      const midCol = agent.col + 1;
-      const midBlocked = state.agents.some(x => x.id !== agent.id && x.col === midCol);
-      if (!midBlocked) return `jump → ${nearBtn.id} at col ${nearBtn.col} is 2 cols ahead — jump to activate it!`;
+      const midBlocked = state.agents.some(x => x.id !== agent.id && x.col === agent.col + 1);
+      if (!midBlocked) return `jump — (${agent.col},${groundY}) to (${nearBtn.col},${groundY}), activate ${nearBtn.id}`;
     }
-    return `move_right ${Math.min(stopAt - agent.col, 6)} → advance toward col ${stopAt}`;
+    const steps = Math.min(stopAt - agent.col, 6);
+    return `move_right ${steps} — forward from (${agent.col},${agent.row}) toward exit (${goalCol},${groundY})`;
   }
 
-  // ── Build AGENTS block ──────────────────────────────────────────────────────
-  const agentsDesc = state.agents.map(a => {
-    const role = assigned[a.id] ? `ASSIGNED→${assigned[a.id].id}` : 'ADVANCE';
-    const sugg = suggest(a);
-    const lastInfo = a.lastAction ? ` last:${a.lastAction}` : '';
+  // ── World state: exact coords for every entity ─────────────────────────────
+  const agentCoords = state.agents.map(a => {
+    const role = assigned[a.id] ? `→${assigned[a.id].id}` : 'ADV';
+    const stuck = (a.stuckTicks||0) > 0 ? ` STUCK${a.stuckTicks}x${a.lastAction}` : '';
+    const last  = a.lastAction ? ` last:${a.lastAction}` : '';
     let warn = '';
-    if ((a.stuckTicks || 0) >= 1) {
-      const midCol = a.col + 1;
-      const midAgent = state.agents.find(x => x.id !== a.id && x.col === midCol);
-      const midBtn = (state.buttons||[]).find(b => b.latch && !b.pressed && b.col === midCol);
-      if (a.lastAction === 'jump' && midAgent) warn = ` ⚠️BLOCKED:${a.stuckTicks}t jump blocked by ${midAgent.id}@col${midCol}→assign ${midAgent.id} move_left`;
-      else if (a.lastAction === 'jump' && midBtn) warn = ` ⚠️BLOCKED:${a.stuckTicks}t jump blocked by pad@col${midCol}→press that pad first`;
-      else warn = ` ⚠️STUCK:${a.stuckTicks}t on ${a.lastAction}→do NOT repeat, try different action`;
+    if ((a.stuckTicks||0) >= 1) {
+      const midAgent = state.agents.find(x => x.id !== a.id && x.col === a.col + 1);
+      const midBtn   = (state.buttons||[]).find(b => b.latch && !b.pressed && b.col === a.col + 1);
+      if (a.lastAction === 'jump' && midAgent) warn = ` ⚠️jump blocked by ${midAgent.id}@(${midAgent.col},${midAgent.row})→${midAgent.id} must move_left`;
+      else if (a.lastAction === 'jump' && midBtn) warn = ` ⚠️jump blocked by pad@(${midBtn.col},${groundY})→press that pad first`;
+      else warn = ` ⚠️STUCK:do NOT repeat ${a.lastAction}`;
     }
-    // Flag if this agent is blocking someone's jump
     const blocking = state.agents.find(x => x.id !== a.id && (x.stuckTicks||0) >= 1 && x.lastAction === 'jump' && x.col + 1 === a.col);
     if (blocking) warn += ` 🚧BLOCKING ${blocking.id}'s jump→move_left NOW`;
-    // Flag if two agents are at the same column (crowding)
     const sameCol = state.agents.find(x => x.id !== a.id && x.col === a.col && x.id < a.id);
-    if (sameCol) warn += ` 📍CROWDED col${a.col} with ${sameCol.id}→one must move_left to decongest`;
-    return `${a.id}(col${a.col},row${a.row}) [${role}]${lastInfo} SUGGESTED:${sugg}${warn}`;
+    if (sameCol) warn += ` 📍CROWDED with ${sameCol.id}@same col→one must move_left`;
+    return `  ${a.id} pos:(${a.col},${a.row}) role:[${role}]${last}${stuck}${warn}\n     → SUGGESTED: ${suggest(a)}`;
   }).join('\n');
 
-  // ── Map overview (compact) ──────────────────────────────────────────────────
-  const mapLines = [
-    ...(state.buttons||[]).map(b => b.pressed ? `${b.id}@col${b.col}:✓PRESSED` : `${b.id}@col${b.col}:UNLATCH(jump from col${b.col-2})`),
-    state.buttonGate ? `ButtonGate@col${state.buttonGate.col}:${state.buttonGate.open?'OPEN':'CLOSED(need all pads)'}` : '',
-    state.gate ? `ZapGate@col${state.gate.col}:${state.gate.open?'OPEN':'CLOSED'} phase${state.tick%state.gate.period}/${state.gate.period} opens≥${state.gate.period-state.gate.openFor}` : '',
-    state.key ? `Key@(${state.key.col},${state.key.row}):${state.key.collected?'collected':'walk onto it'}` : '',
-    state.door ? `Door@col${state.door.col}:${state.door.open?'OPEN':'CLOSED(need key)'}` : '',
-    pits.length ? `Pits:col(s)${pits.join(',')} FATAL—jump from pitCol-1` : '',
-    `Exit:col${goalCol}`,
-  ].filter(Boolean).join(' | ');
+  const btnCoords = (state.buttons||[]).map(b =>
+    b.pressed
+      ? `  ${b.id} (${b.col},${groundY}) ✓PRESSED`
+      : `  ${b.id} (${b.col},${groundY}) UNPRESSED — jump-from:(${b.col-2},${groundY}), mid-path:(${b.col-1},${groundY})`
+  ).join('\n') || '  none';
 
-  // ── Learning context from session memory ───────────────────────────────────
-  const learnedLines = _mem.progressEvents.slice(-4).map(e => {
-    if (e.event === 'btn_pressed') return `✓ ${e.btnId} pressed at t${e.tick} by ${e.agentId||'?'} → that agent should now ADVANCE RIGHT`;
-    if (e.event === 'key_collected') return `✓ key collected at t${e.tick} by ${e.agentId||'?'} → all agents should ADVANCE RIGHT`;
-    return null;
-  }).filter(Boolean);
-  const learnedSection = learnedLines.length
-    ? `\nLEARNED THIS RUN (use to guide decisions):\n${learnedLines.join('\n')}`
+  const obstacleLines = [
+    state.buttonGate ? `  ButtonGate (${state.buttonGate.col},${groundY}): ${state.buttonGate.open ? 'OPEN — walk through' : 'CLOSED — need all pads pressed'}` : '',
+    state.gate        ? `  ZapGate (${state.gate.col},${groundY}): ${state.gate.open?'OPEN':'CLOSED'} phase=${state.tick%state.gate.period}/${state.gate.period} opens_at_phase=${state.gate.period - state.gate.openFor}` : '',
+    state.key         ? `  Key (${state.key.col},${state.key.row}): ${state.key.collected ? 'COLLECTED' : 'available — walk onto it'}` : '',
+    state.door        ? `  Door (${state.door.col},${groundY}): ${state.door.open ? 'OPEN' : 'LOCKED — need key'}` : '',
+    pits.length       ? `  Pits at cols:[${pits.join(',')}] row:${groundY} — FATAL, jump from col pitCol-1` : '',
+    hazards.filter(h=>h.row===groundY).length ? `  Hazards at cols:[${hazards.filter(h=>h.row===groundY).map(h=>h.col).join(',')}] row:${groundY} — jump over` : '',
+    `  Exit col:${goalCol} row:${groundY}`,
+  ].filter(Boolean).join('\n');
+
+  // ── Progress vectors ────────────────────────────────────────────────────────
+  const progressLines = state.agents.map(a => {
+    const vec = agentProgressVector(a.id);
+    const hist = _mem.agentColHistory[a.id] || [];
+    const arrow = vec > 0 ? `→+${vec} GROWING (keep going right)` : vec < 0 ? `←${vec} shrinking (was repositioning — now go right)` : `= 0 FLAT (stuck, must change approach)`;
+    return `  ${a.id}: col history [${hist.join(',')}] net:${arrow}`;
+  });
+  // Overall score trend
+  const scores = _mem.scoreHistory;
+  let scoreTrend = '';
+  if (scores.length >= 2) {
+    const delta = scores[scores.length - 1].score - scores[0].score;
+    scoreTrend = delta > 0 ? `Overall progress score +${delta} (growing ✓ — keep doing what's working)`
+      : delta === 0 ? `Overall progress score FLAT (no improvement — all agents must push right)`
+      : `Overall progress score ${delta} (regressing — something went wrong, push right)`;
+  }
+
+  // ── Death history ───────────────────────────────────────────────────────────
+  const deathSection = _mem.deathHistory.length
+    ? '\nDEATH HISTORY — learn from past attempts, avoid repeating these mistakes:\n'
+      + _mem.deathHistory.map(d =>
+          `  Attempt ${d.attempt}: ${d.cause} | died: ${d.victims} | all positions: ${d.allPos}`
+          + (d.dangerCols.length ? ` | DANGER cols:[${d.dangerCols.join(',')}] — MUST JUMP over these` : '')
+        ).join('\n')
     : '';
 
-  return `COORDINATOR for agents A,B,C,D in Agent Park. Tick ${state.tick}.
-RULES: ${levelRules.replace(/\n/g,' ').slice(0,300)}
-MAP: ${mapLines}
-AGENTS (with SUGGESTED action computed from physics):
-${agentsDesc}${learnedSection}
-PHYSICS CONSTRAINTS:
-- jump from col X fails if col X+1 has any agent OR unpressed pad. Check before jumping.
-- Pads activate only via jump (from padCol-2) or move_up (on pad). Walking does NOT activate.
-- After pressing a pad: immediately move_left to vacate, freeing path for next pad.
-- Pads must be pressed ONE AT A TIME (left pad first when adjacent).
-- move_right stops automatically at closed gates/pads/walls.
-HARD RULES — NEVER violate:
-- Do NOT repeat an action that left an agent's col unchanged (⚠️STUCK means this happened).
-- Do NOT assign move_up unless an agent is on a button pad or stacking platform.
-- After a pad is pressed (see LEARNED), the pressing agent must advance right — do NOT send it back.
-INSTRUCTIONS: Follow the SUGGESTED action for each agent unless there is a ⚠️ or 🚧 warning. Fix warnings first. Respond ONLY with JSON:
-{"plan":"...","actions":[{"agentId":"A","thought":"≤5 words","action":"...","amount":1},{"agentId":"B","thought":"≤5 words","action":"...","amount":1},{"agentId":"C","thought":"≤5 words","action":"...","amount":1},{"agentId":"D","thought":"≤5 words","action":"...","amount":1}]}`;
+  // ── Learning context ────────────────────────────────────────────────────────
+  const learnedLines = _mem.progressEvents.slice(-5).map(e => {
+    if (e.event === 'btn_pressed')   return `  ✓ ${e.btnId} pressed at t${e.tick} by ${e.agentId||'?'} → ${e.agentId||'that agent'} is FREE, must ADVANCE RIGHT toward exit`;
+    if (e.event === 'key_collected') return `  ✓ key collected at t${e.tick} by ${e.agentId||'?'} → ALL agents ADVANCE RIGHT`;
+    return null;
+  }).filter(Boolean);
+
+  return `AGENT PARK COORDINATOR — Tick ${state.tick}
+OBJECTIVE: Move ALL 4 agents (A,B,C,D) to Exit col ${goalCol}. This is a RIGHT-MOVING game. Forward = move_right. That is ALWAYS the default.
+
+LEVEL RULES: ${levelRules.replace(/\n/g,' ').slice(0,280)}
+
+PROGRESS BAR (use this to decide direction — growing = right is working):
+${progressLines.join('\n')}${scoreTrend ? '\n  ' + scoreTrend : ''}
+
+AGENTS (current positions + what to do):
+${agentCoords}
+
+BUTTONS:
+${btnCoords}
+
+OBSTACLES & WORLD:
+${obstacleLines}
+${deathSection}${learnedLines.length ? '\nLEARNED THIS RUN:\n' + learnedLines.join('\n') : ''}
+MOVEMENT POLICY (strictly follow):
+  DEFAULT → move_right. Always push forward unless a specific exception below applies.
+  move_left → ONLY to: (1) reposition for a button jump, (2) clear mid-path for a teammate jump, (3) escape a confirmed block
+  wait → ONLY when: (1) at a closed gate waiting for it to open, (2) at exit already, (3) must let teammate press pad first
+  jump → when a pit/hazard is 1 col ahead OR when at jump spot (btnCol-2) for a button
+  move_up → ONLY when standing ON a button pad col
+
+HARD RULES:
+  • NEVER repeat an action marked ⚠️STUCK — it changed nothing, pick something else
+  • NEVER move_left an ADVANCE agent unless it is explicitly blocking a teammate's jump
+  • Once a button is pressed (see LEARNED), the agent that pressed it must advance right immediately
+
+Respond ONLY with JSON (no markdown):
+{"plan":"≤10 words describing coordinated strategy","actions":[{"agentId":"A","thought":"≤5 words","action":"...","amount":1},{"agentId":"B","thought":"≤5 words","action":"...","amount":1},{"agentId":"C","thought":"≤5 words","action":"...","amount":1},{"agentId":"D","thought":"≤5 words","action":"...","amount":1}]}`;
 }
 
 // ── API ────────────────────────────────────────────────────────────────────────
@@ -305,12 +384,15 @@ export async function getAllAgentDecisions(state, levelRules) {
   }
   _mem.prevBtnStates = { btns: curBtnStates, keyCollected: !!state.key?.collected };
 
-  // ── Track agent col history (last 4 positions) ────────────────────────────
+  // ── Track agent col history + overall progress score ─────────────────────
   for (const a of state.agents) {
     if (!_mem.agentColHistory[a.id]) _mem.agentColHistory[a.id] = [];
     _mem.agentColHistory[a.id].push(a.col);
-    if (_mem.agentColHistory[a.id].length > 4) _mem.agentColHistory[a.id].shift();
+    if (_mem.agentColHistory[a.id].length > 6) _mem.agentColHistory[a.id].shift();
   }
+  const score = computeProgressScore(state);
+  _mem.scoreHistory.push({ tick: state.tick, score });
+  if (_mem.scoreHistory.length > 8) _mem.scoreHistory.shift();
 
   // ── Loop detection: same exact config seen 3+ times → force escape ────────
   const configHash = hashConfig(state);
@@ -346,18 +428,24 @@ export async function getAllAgentDecisions(state, levelRules) {
     }
   }
 
-  // Button-proximity heuristic: unassigned free agent exactly 2 cols before an unpressed button → jump deterministically
-  for (const agent of state.agents) {
-    if (lockedActions[agent.id]) continue;
-    const nearBtn = (state.buttons || []).find(b =>
-      !b.pressed && b.col === agent.col + 2 && !Object.values(state.btnAssignments).includes(b.id)
-    );
-    if (nearBtn) {
-      const midCol = agent.col + 1;
-      const midBlocked = state.agents.some(x => x.id !== agent.id && x.col === midCol);
-      if (!midBlocked) {
-        lockedActions[agent.id] = { agentId: agent.id, action: 'jump', amount: 1, thought: `→ ${nearBtn.id}`, message: '', reasoning: '' };
-      }
+  // Proximity auto-assign: any free agent within 6 cols of a button's jump spot gets routed
+  // there deterministically. Processes agents left-to-right so the closest one claims each button.
+  const PROX_RANGE = 6;
+  const claimedBtns = new Set(Object.values(state.btnAssignments)); // already locked buttons
+  const sortedAgents = [...state.agents].sort((a, b) => a.col - b.col);
+  for (const agent of sortedAgents) {
+    if (lockedActions[agent.id]) continue; // already has a deterministic action
+    // Find the closest unclaimed unpressed button whose jump spot is ahead of this agent
+    const target = [...(state.buttons || [])]
+      .filter(b => !b.pressed && !claimedBtns.has(b.id))
+      .map(b => ({ btn: b, dist: (b.col - 2) - agent.col }))
+      .filter(({ dist }) => dist >= 0 && dist <= PROX_RANGE)
+      .sort((a, b) => a.dist - b.dist)[0]?.btn;
+    if (target) {
+      claimedBtns.add(target.id);
+      state.btnAssignments[agent.id] = target.id; // lock this agent to the button
+      const act = lockedAction(agent, target, state);
+      lockedActions[agent.id] = { agentId: agent.id, ...act, message: '', reasoning: '' };
     }
   }
 
@@ -367,22 +455,47 @@ export async function getAllAgentDecisions(state, levelRules) {
     return state.agents.map(a => lockedActions[a.id]);
   }
 
-  // ── Loop escape: spread free agents when same config repeats ─────────────
-  if (isLoop) {
-    // Sort free agents left-to-right; alternate push-right / pull-left to break clustering
-    const sorted = [...freeAgents].sort((a, b) => a.col - b.col);
-    const escapeActions = sorted.map((agent, i) => {
-      const colHist = _mem.agentColHistory[agent.id] || [];
-      const drifted = colHist.length >= 2 && colHist[colHist.length - 1] === colHist[colHist.length - 2];
-      // If this agent has been stationary: move opposite to last action
-      let action = 'move_right';
-      if (drifted) {
-        action = (agent.lastAction === 'move_right' || agent.lastAction === 'jump') ? 'move_left' : 'move_right';
-      } else {
-        // Alternate: even index go right, odd index go left (creates spread)
-        action = i % 2 === 0 ? 'move_right' : 'move_left';
+  // ── Hold free agents when all buttons are already covered ─────────────────
+  // If every unpressed button already has a locked agent heading to it, free agents
+  // have NOTHING useful to do — don't send them into button lanes via the LLM.
+  const unpressedBtns = (state.buttons || []).filter(b => !b.pressed);
+  const assignedBtnIds = new Set(Object.values(state.btnAssignments));
+  const allBtnsCovered = unpressedBtns.length > 0
+    && unpressedBtns.every(b => assignedBtnIds.has(b.id))
+    && !state.buttonGate?.open;
+
+  if (allBtnsCovered) {
+    // Danger cols: jump spot (btn.col-2) and mid-path (btn.col-1) of every unpressed button
+    const dangerCols = new Set(unpressedBtns.flatMap(b => [b.col - 2, b.col - 1]));
+    return state.agents.map(a => {
+      if (lockedActions[a.id]) return lockedActions[a.id];
+      // If in a danger col, step left to clear the lane
+      if (dangerCols.has(a.col)) {
+        return { agentId: a.id, action: 'move_left', amount: 1, thought: 'clear lane', message: '', reasoning: '' };
       }
-      return { agentId: agent.id, action, amount: 1, thought: 'break loop', message: '', reasoning: '' };
+      // Otherwise hold — don't crowd the button area
+      return { agentId: a.id, action: 'wait', thought: 'holding — btns covered', message: '', reasoning: '' };
+    });
+  }
+
+  // ── Loop escape: break repeated config — bias heavily toward move_right ──────
+  if (isLoop) {
+    const escapeActions = freeAgents.map(agent => {
+      // If this agent's progress vector is positive, they're already moving right — keep it
+      if (agentProgressVector(agent.id) > 0) {
+        return { agentId: agent.id, action: 'move_right', amount: 1, thought: 'progress growing →', message: '', reasoning: '' };
+      }
+      // Only step left if this agent is actively blocking a teammate's jump
+      const isBlocker = state.agents.some(x =>
+        x.id !== agent.id && (x.stuckTicks||0) > 0 && x.lastAction === 'jump' && x.col + 1 === agent.col
+      );
+      // Or if move_right has been stuck multiple ticks AND not because of a gate (try jump instead)
+      const rightStuck = agent.lastAction === 'move_right' && (agent.stuckTicks||0) >= 2;
+      let action = 'move_right';
+      let thought = 'push forward';
+      if (isBlocker) { action = 'move_left'; thought = 'unblock teammate'; }
+      else if (rightStuck) { action = 'jump'; thought = 'try jumping obstacle'; }
+      return { agentId: agent.id, action, amount: 1, thought, message: '', reasoning: '' };
     });
     const escapeMap = Object.fromEntries(escapeActions.map(a => [a.agentId, a]));
     return state.agents.map(a => lockedActions[a.id] || escapeMap[a.id]
@@ -396,8 +509,8 @@ export async function getAllAgentDecisions(state, levelRules) {
       { role: 'system', content: 'You are a game coordinator. Respond with valid JSON only. No markdown fences.' },
       { role: 'user',   content: buildCoordinatorPrompt(state, levelRules) },
     ],
-    temperature: 0.4,
-    max_tokens:  700,
+    temperature: 0.3,
+    max_tokens:  500,
   });
   const aiActions = parseCoordinatorResponse(data.choices[0].message.content);
 
@@ -408,25 +521,55 @@ export async function getAllAgentDecisions(state, levelRules) {
       || { agentId: a.id, action: 'move_right', amount: 1, thought: 'advance', message: '', reasoning: '' };
   });
 
-  // Anti-loop: if a FREE agent is stuck 2+ ticks on same action, jiggle
+  // Forward-bias override: ADVANCE agents that the LLM sends left without justification → move_right
+  const goalCol = state.goalCol ?? 10;
   final.forEach(act => {
-    if (lockedActions[act.agentId]) return; // locked agents handled above
+    if (lockedActions[act.agentId]) return;
+    if (act.action !== 'move_left') return;
     const agent = state.agents.find(x => x.id === act.agentId);
-    if (!agent || (agent.stuckTicks || 0) < 2 || act.action !== agent.lastAction) return;
-    const isBlocker = state.agents.some(a => a.id !== agent.id && (a.stuckTicks||0) > 0 && a.lastAction === 'jump' && a.col + 1 === agent.col);
-    // If stuck on move_up (no platform above), move forward
-    if (agent.lastAction === 'move_up') {
+    if (!agent) return;
+    // Allow move_left only if: assigned to a button and repositioning, blocking a teammate,
+    // or sitting on a button's mid-path (can't move right OR jump from here — must step back)
+    const assignedBtn = state.btnAssignments?.[agent.id]
+      ? (state.buttons||[]).find(b => b.id === state.btnAssignments[agent.id]) : null;
+    const needsReposition = assignedBtn && agent.col > assignedBtn.col - 2 && agent.col < assignedBtn.col;
+    const isBlocker = state.agents.some(x =>
+      x.id !== agent.id && (x.stuckTicks||0) > 0 && x.lastAction === 'jump' && x.col + 1 === agent.col
+    );
+    const isAtMidPath = (state.buttons||[]).some(b => !b.pressed && b.col - 1 === agent.col);
+    if (!needsReposition && !isBlocker && !isAtMidPath && agent.col < goalCol) {
       act.action = 'move_right';
       act.amount = 1;
-      act.thought = 'no platform — moving right';
-      return;
+      act.thought = 'forward bias';
     }
-    act.action = (isBlocker || agent.col > 1) ? 'move_left' : 'move_right';
-    act.amount = 1;
-    act.thought = 'jiggle';
   });
 
-  // Dedup: if two free agents are at the same column doing the same action, stagger one
+  // Anti-loop: FREE agent stuck 2+ ticks on same action → break it, preferring move_right
+  final.forEach(act => {
+    if (lockedActions[act.agentId]) return;
+    const agent = state.agents.find(x => x.id === act.agentId);
+    if (!agent || (agent.stuckTicks || 0) < 2 || act.action !== agent.lastAction) return;
+    // If agent's progress vector shows rightward movement, it's working — don't jiggle it
+    if (agentProgressVector(agent.id) > 0 && act.action === 'move_right') return;
+    const isBlocker = state.agents.some(a => a.id !== agent.id && (a.stuckTicks||0) > 0 && a.lastAction === 'jump' && a.col + 1 === agent.col);
+    if (agent.lastAction === 'move_up') {
+      act.action = 'move_right'; act.amount = 1; act.thought = 'no platform — go right';
+      return;
+    }
+    if (agent.lastAction === 'move_right') {
+      // Stuck at a button's mid-path col — can't jump through it either, must step back
+      const atMidPath = (state.buttons||[]).some(b => !b.pressed && b.col - 1 === agent.col);
+      act.action = atMidPath ? 'move_left' : 'jump';
+      act.thought = atMidPath ? 'clear btn mid-path' : 'jump obstacle';
+      return;
+    }
+    // Default: move_left only if blocking someone, else go right
+    act.action = isBlocker ? 'move_left' : 'move_right';
+    act.amount = 1;
+    act.thought = isBlocker ? 'unblock' : 'push forward';
+  });
+
+  // Dedup: two free agents at same col doing same non-wait action → one goes right, one waits
   const seenColAction = {};
   final.forEach(act => {
     if (lockedActions[act.agentId] || act.action === 'wait') return;
@@ -434,10 +577,8 @@ export async function getAllAgentDecisions(state, levelRules) {
     if (!agent) return;
     const key = `${agent.col}:${act.action}`;
     if (seenColAction[key]) {
-      // This agent is crowding — step it back one col
-      act.action = 'move_left';
-      act.amount = 1;
-      act.thought = 'decongest';
+      // Second agent at same spot: make it wait one tick to stagger
+      act.action = 'wait'; act.thought = 'stagger';
     } else {
       seenColAction[key] = true;
     }
@@ -739,7 +880,11 @@ function calcMoveRightAmount(agent, state, overrideTarget = null) {
   }
   for (const b of (state.buttons || [])) {
     if (b.latch && !b.pressed) {
-      const delta = (b.col - 1) - agent.col;
+      // Without a target: stop 3 cols before the button (col-3) to stay clear of the
+      // jump lane (col-2) and mid-path (col-1). With an override target the caller
+      // controls position, so use the original 1-col buffer.
+      const stopOffset = overrideTarget === null ? 3 : 1;
+      const delta = (b.col - stopOffset) - agent.col;
       if (delta > 0 && delta < amount) amount = delta;
     }
   }

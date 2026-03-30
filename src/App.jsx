@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { LEVELS } from './levels.js';
 import { applyActions } from './gameEngine.js';
-import { getAllAgentDecisions, getAllFallbackDecisions, resetMemory } from './agentAI.js';
+import { getAllAgentDecisions, getAllFallbackDecisions, resetMemory, softResetMemory, recordDeath } from './agentAI.js';
 import { maxStepDurationMs } from './motionConfig.js';
 import GameScene from './components/GameScene.jsx';
 import AgentPanel from './components/AgentPanel.jsx';
@@ -52,6 +52,7 @@ export default function App() {
   const processAfterCommitRef = useRef(null);
   const noProgressRef = useRef(0);
   const lastProgressSnapshotRef = useRef(null);
+  const restartGenRef = useRef(0);  // incremented on every restart; guards stale timeouts
 
   const level = LEVELS[levelIdx];
   levelRef.current = level;
@@ -73,6 +74,10 @@ export default function App() {
     fresh.failMessage = '';
     fresh.btnAssignments = {};
     resetMemory();
+    window.__agentDeathCount = 0;
+    restartGenRef.current += 1; // cancel any pending auto-restart timeouts
+    noProgressRef.current = 0;
+    lastProgressSnapshotRef.current = null;
     setGameState(fresh);
     stateRef.current = fresh;
     setShowWin(false);
@@ -178,6 +183,58 @@ export default function App() {
     if (!runningRef.current) return;
 
     if (next.levelFailed) {
+      blendRef.current = null;
+      setMotionBlend(null);
+
+      // In AI mode: record death + auto-restart without requiring a button press
+      if (!demoRef.current && runningRef.current) {
+        recordDeath(next);
+        const attemptNum = (window.__agentDeathCount = (window.__agentDeathCount || 0) + 1);
+        const gen = ++restartGenRef.current; // invalidates any pending no-progress timeout
+
+        // Show death position briefly, then restart
+        stateRef.current = next;
+        setGameState(prev => ({
+          ...prev,
+          agents: next.agents, // show death positions
+          log: [...(prev.log || []), {
+            type: 'system', tick: next.tick,
+            text: `💀 t${next.tick} — restarting attempt ${attemptNum + 1}, AI learned death location`,
+          }],
+        }));
+
+        noProgressRef.current = 0;
+        lastProgressSnapshotRef.current = null;
+
+        setTimeout(() => {
+          if (!runningRef.current || restartGenRef.current !== gen) return;
+          const lvl   = levelRef.current;
+          const fresh = JSON.parse(JSON.stringify(lvl.initialState));
+          fresh.gridCols    = lvl.gridCols;
+          fresh.gridRows    = lvl.gridRows;
+          fresh.goalCol     = lvl.goalCol;
+          fresh.groundY     = lvl.groundY;
+          fresh.pits        = lvl.pits || [];
+          if (fresh.key        === undefined) fresh.key        = null;
+          if (fresh.buttonGate === undefined) fresh.buttonGate = null;
+          fresh.hazards     = lvl.hazards || [];
+          fresh.pitFatal    = !!lvl.pitFatal;
+          fresh.levelFailed = false;
+          fresh.failMessage = '';
+          fresh.btnAssignments = {};
+          fresh.log = [{ type: 'system', tick: 0, text: `🔄 Attempt ${attemptNum + 1} — AI avoiding death col from last run` }];
+          softResetMemory();
+          blendRef.current = null;
+          setMotionBlend(null);
+          setThinkingAgents(new Set());
+          stateRef.current = fresh;
+          setGameState(fresh);
+          runLLMStep(fresh);
+        }, 700);
+        return;
+      }
+
+      // Demo or stopped: full reset
       setRunning(false);
       runningRef.current = false;
       blendRef.current = null;
@@ -214,27 +271,32 @@ export default function App() {
         if (noProgressRef.current >= 22) {
           noProgressRef.current = 0;
           lastProgressSnapshotRef.current = null;
+          const gen = ++restartGenRef.current;
           setGameState(prev => ({
             ...prev,
-            log: [...(prev.log || []), { type: 'system', tick: next.tick, text: '🔄 No progress — auto-restarting to try a different approach…' }],
+            log: [...(prev.log || []), { type: 'system', tick: next.tick, text: '🔄 No progress — auto-restarting…' }],
           }));
           setTimeout(() => {
-            if (!runningRef.current) return;
-            // Reset state but keep simulation running in AI mode
-            const fresh = JSON.parse(JSON.stringify(levelRef.current.initialState));
-            fresh.gridCols   = levelRef.current.gridCols;
-            fresh.gridRows   = levelRef.current.gridRows;
-            fresh.goalCol    = levelRef.current.goalCol;
-            fresh.groundY    = levelRef.current.groundY;
-            fresh.pits       = levelRef.current.pits || [];
-            fresh.hazards    = levelRef.current.hazards || [];
-            fresh.pitFatal   = !!levelRef.current.pitFatal;
+            if (!runningRef.current || restartGenRef.current !== gen) return;
+            const lvl   = levelRef.current;
+            const fresh = JSON.parse(JSON.stringify(lvl.initialState));
+            fresh.gridCols   = lvl.gridCols;
+            fresh.gridRows   = lvl.gridRows;
+            fresh.goalCol    = lvl.goalCol;
+            fresh.groundY    = lvl.groundY;
+            fresh.pits       = lvl.pits || [];
+            if (fresh.key        === undefined) fresh.key        = null;
+            if (fresh.buttonGate === undefined) fresh.buttonGate = null;
+            fresh.hazards    = lvl.hazards || [];
+            fresh.pitFatal   = !!lvl.pitFatal;
             fresh.levelFailed = false;
             fresh.failMessage = '';
+            fresh.btnAssignments = {};
             fresh.log = [{ type: 'system', tick: 0, text: '🔄 Retrying…' }];
-            resetMemory();
+            softResetMemory();
             blendRef.current = null;
             setMotionBlend(null);
+            setThinkingAgents(new Set());
             stateRef.current = fresh;
             setGameState(fresh);
             runLLMStep(fresh);
